@@ -1,0 +1,20 @@
+[package]
+name = "kv-squeeze"
+version = "0.1.0"
+edition = "2021"
+description = "KV cache compression library for LLM inference on memory-constrained devices"
+
+[dependencies]
+half = { version = "2", features = ["std"] }
+rayon = "1"
+comfy-table = "7"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+
+[lib]
+name = "kv_squeeze"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kv-squeeze"
+path = "src/main.rs"
