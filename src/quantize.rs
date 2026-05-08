@@ -75,94 +75,152 @@ pub fn dequantize_fp16(data: &[f16]) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// FP8 E4M3 quantization (manual)
+// FP8 E4M3 quantization (proper bit-level encoding)
 //
-// Layout: 1 sign | 4 exponent | 3 mantissa
-// Bias = 7, exponent range [0,15], max normal ≈ 448, smallest normal ≈ 2^-6
-// We clamp inputs to representable range, no NaN/Inf encoding.
+// Layout: 1 sign | 4 exponent (bias 7) | 3 mantissa
+// - Exponent 0b0000, mantissa != 0 → subnormal: (-1)^s × 2^(-6) × (mant/8)
+// - Exponent 0b0000, mantissa == 0 → zero
+// - Exponent 0b1111, mantissa == 0b111 → NaN (E4M3 has NO infinity)
+// - Normal: exponent 1–14 → (-1)^s × 2^(exp-7) × (1 + mant/8)
+// - Max finite: exp=14, mant=6 → 1.75 × 2^7 = 448 (0b_s_1110_110)
+//   Note: exp=14, mant=7 (0x77 unsigned) = 1.875 × 128 = 240… wait:
+//   Actually max finite is exp=14, mant=7? No: exp=15, mant=6 would be
+//   normal but exp=15 is only valid with mant=7 for NaN.
+//   Let's be precise: exponents 1–14 are normal. Exponent 15 is special:
+//   only (15, 7) = NaN. All other (15, 0–6) are valid normals.
+//   So max finite = exp=15, mant=6 = 1.75 × 2^8 = 448.
+//   And exp=14, mant=7 = 1.875 × 2^7 = 240.
 // ---------------------------------------------------------------------------
 
-const FP8_EXP_BIAS: i32 = 7;
-const FP8_MAX_EXP: i32 = 15;
-const FP8_MANT_BITS: u32 = 3;
-
-/// Largest finite FP8 E4M3 value: (1 + 7/8) * 2^(15-7) = 1.875 * 256 = 448
+/// Largest finite FP8 E4M3 value: exp=15, mant=6 → (1+6/8) × 2^(15-7) = 1.75 × 256 = 448
+#[allow(dead_code)]
 const FP8_MAX_VAL: f32 = 448.0;
 
 /// Encode a single f32 to FP8 E4M3 (packed u8).
+///
+/// Handles zeros, subnormals, normals, NaN, and infinity (mapped to NaN since
+/// E4M3 has no infinity representation). Values exceeding the representable
+/// range are clamped to ±448.
 fn encode_fp8(val: f32) -> u8 {
-    if val == 0.0 {
-        // Preserve sign of zero
-        if val.is_sign_negative() {
-            return 0x80;
-        }
-        return 0x00;
+    let bits = val.to_bits();
+    let sign = ((bits >> 31) & 1) as u8;
+    let f32_exp = ((bits >> 23) & 0xFF) as i32;
+    let f32_mant = bits & 0x7F_FFFF;
+
+    // Handle f32 special values: NaN or infinity → E4M3 NaN
+    if f32_exp == 0xFF {
+        return (sign << 7) | 0x7F; // exp=15, mant=7 → NaN
     }
 
-    let sign: u8 = if val < 0.0 { 1 } else { 0 };
-    let abs = val.abs().min(FP8_MAX_VAL);
-
-    // Decompose: abs = mantissa * 2^exp where 1.0 <= mantissa < 2.0
-    // Use f32 bits to extract
-    let bits = abs.to_bits();
-    let f32_exp = ((bits >> 23) & 0xFF) as i32 - 127; // unbiased exponent
-    let f32_frac = bits & 0x7FFFFF; // 23-bit fraction
-
-    // Biased exponent for FP8
-    let biased_exp = f32_exp + FP8_EXP_BIAS;
-
-    if biased_exp <= 0 {
-        // Subnormal or underflow — flush to zero
+    // Handle zero (preserves sign)
+    if f32_exp == 0 && f32_mant == 0 {
         return sign << 7;
     }
 
-    let clamped_exp = biased_exp.min(FP8_MAX_EXP) as u8;
-
-    // Round the 23-bit mantissa to 3 bits (take top 3 bits, round-to-nearest-even)
-    let mant_3 = (f32_frac >> (23 - FP8_MANT_BITS)) as u8;
-    let remainder = f32_frac & ((1 << (23 - FP8_MANT_BITS)) - 1);
-    let halfway = 1u32 << (23 - FP8_MANT_BITS - 1);
-
-    let rounded_mant = if remainder > halfway || (remainder == halfway && (mant_3 & 1) == 1) {
-        mant_3 + 1
+    // Compute unbiased exponent (f32 bias = 127)
+    let exp_unbiased = if f32_exp == 0 {
+        -126i32 // f32 subnormal
     } else {
-        mant_3
+        f32_exp - 127
     };
 
-    // Handle mantissa overflow (carry into exponent)
-    if rounded_mant >= (1 << FP8_MANT_BITS) {
-        let new_exp = clamped_exp + 1;
-        if new_exp > FP8_MAX_EXP as u8 {
-            // Overflow to max representable
-            return (sign << 7) | ((FP8_MAX_EXP as u8) << FP8_MANT_BITS) | 0x07;
-        }
-        return (sign << 7) | (new_exp << FP8_MANT_BITS) | 0x00;
+    // Build full 24-bit mantissa with implicit bit
+    let full_mant = if f32_exp == 0 {
+        f32_mant << 1 // f32 subnormal: no implicit 1, shift up
+    } else {
+        f32_mant | 0x80_0000 // f32 normal: add implicit 1
+    };
+
+    // E4M3 bias = 7
+    // Normal exponent range: stored 1–15, unbiased -6 to 8
+    // But stored exp=15 with mant=7 is NaN, so max usable:
+    //   exp=15, mant=6 (value 448) or exp=15, mant<7
+    // Subnormal: stored exp=0, value = 2^(-6) × (mant/8)
+
+    // Overflow: clamp to max finite (448.0 = exp=15, mant=6)
+    if exp_unbiased > 8 {
+        return (sign << 7) | 0x7E; // 0b_s_1111_110
     }
 
-    (sign << 7) | (clamped_exp << FP8_MANT_BITS) | rounded_mant
+    // Underflow: too small even for smallest subnormal (2^-9)
+    if exp_unbiased < -9 {
+        return sign << 7; // flush to zero
+    }
+
+    // Subnormal E4M3 range: unbiased exponent < -6
+    if exp_unbiased < -6 {
+        // Subnormal: stored exp = 0, value = 2^(-6) × (mant/8)
+        // Derivation: mant = full_mant × 2^(exp_unbiased - 14)
+        //           = full_mant >> (14 - exp_unbiased)
+        let total_shift = (14 - exp_unbiased) as u32;
+        let mant_shifted = full_mant >> total_shift;
+        // Round-to-nearest: check the bit just below
+        let round_bit = if total_shift > 0 {
+            (full_mant >> (total_shift - 1)) & 1
+        } else {
+            0
+        };
+        let mant_rounded = (mant_shifted + round_bit).min(7) as u8;
+        if mant_rounded == 0 {
+            return sign << 7; // rounded down to zero
+        }
+        // If rounding pushed mant to 8, it becomes the smallest normal
+        if mant_rounded >= 8 {
+            return (sign << 7) | 0x08; // exp=1, mant=0
+        }
+        return (sign << 7) | mant_rounded;
+    }
+
+    // Normal E4M3 range
+    let stored_exp = (exp_unbiased + 7) as u8; // bias = 7
+
+    // Extract top 3 mantissa bits from the 23-bit fractional part
+    // (full_mant bit 23 is the implicit 1, bits 22..0 are fractional)
+    let mant_3bit = ((full_mant >> 20) & 0x7) as u8;
+    let round_bit = ((full_mant >> 19) & 1) as u8;
+
+    let mut result_mant = mant_3bit + round_bit;
+    let mut result_exp = stored_exp;
+
+    // Mantissa overflow from rounding: carry into exponent
+    if result_mant > 7 {
+        result_mant = 0;
+        result_exp += 1;
+    }
+
+    // Check if we'd produce NaN (exp=15, mant=7) or exceed range
+    if result_exp > 15 || (result_exp == 15 && result_mant == 7) {
+        // Clamp to max finite: exp=15, mant=6 (448.0)
+        return (sign << 7) | 0x7E;
+    }
+
+    (sign << 7) | (result_exp << 3) | result_mant
 }
 
 /// Decode FP8 E4M3 (packed u8) back to f32.
 fn decode_fp8(byte: u8) -> f32 {
     let sign = (byte >> 7) & 1;
-    let exp = ((byte >> FP8_MANT_BITS) & 0x0F) as i32;
-    let mant = (byte & 0x07) as u32;
+    let exp = ((byte >> 3) & 0xF) as i32;
+    let mant = (byte & 0x7) as u32;
 
-    if exp == 0 && mant == 0 {
-        return if sign == 1 { -0.0 } else { 0.0 };
+    // NaN: exp=15, mant=7
+    if exp == 15 && mant == 7 {
+        return f32::NAN;
     }
 
-    let val = if exp == 0 {
-        // Subnormal: 0.mantissa * 2^(1 - bias)
-        let frac = mant as f64 / (1u64 << FP8_MANT_BITS) as f64;
-        (frac * 2.0_f64.powi(1 - FP8_EXP_BIAS)) as f32
-    } else {
-        // Normal: (1 + mantissa/8) * 2^(exp - bias)
-        let frac = 1.0 + mant as f64 / (1u64 << FP8_MANT_BITS) as f64;
-        (frac * 2.0_f64.powi(exp - FP8_EXP_BIAS)) as f32
-    };
+    let sign_f = if sign == 1 { -1.0f32 } else { 1.0f32 };
 
-    if sign == 1 { -val } else { val }
+    if exp == 0 {
+        if mant == 0 {
+            // Signed zero
+            return if sign == 1 { -0.0 } else { 0.0 };
+        }
+        // Subnormal: (-1)^s × 2^(-6) × (mant / 8)
+        return sign_f * (2.0f32).powi(-6) * (mant as f32 / 8.0);
+    }
+
+    // Normal: (-1)^s × 2^(exp - 7) × (1 + mant / 8)
+    sign_f * (2.0f32).powi(exp - 7) * (1.0 + mant as f32 / 8.0)
 }
 
 /// Quantize FP32 slice to FP8 E4M3 (parallel).
@@ -449,6 +507,18 @@ mod tests {
 
     #[test]
     fn fp8_preserves_zero() {
+        // Positive and negative zero
+        assert_eq!(encode_fp8(0.0), 0x00);
+        assert_eq!(encode_fp8(-0.0), 0x80);
+
+        let r_pos = decode_fp8(0x00);
+        let r_neg = decode_fp8(0x80);
+        assert_eq!(r_pos, 0.0);
+        assert!(!r_pos.is_sign_negative());
+        assert_eq!(r_neg, 0.0);
+        assert!(r_neg.is_sign_negative());
+
+        // Round-trip via public API
         let data = vec![0.0_f32, -0.0, 0.0];
         let q = quantize_fp8(&data);
         let r = dequantize_fp8(&q);
@@ -458,12 +528,176 @@ mod tests {
     }
 
     #[test]
-    fn fp8_clamps_large_values() {
-        let data = vec![1000.0_f32, -1000.0];
+    fn fp8_nan_encoding() {
+        // f32 NaN → E4M3 NaN
+        let encoded = encode_fp8(f32::NAN);
+        assert_eq!(encoded & 0x7F, 0x7F, "NaN should encode to exp=15, mant=7");
+
+        // f32 infinity → E4M3 NaN (no infinity in E4M3)
+        let enc_inf = encode_fp8(f32::INFINITY);
+        assert_eq!(enc_inf & 0x7F, 0x7F, "Inf should map to NaN");
+        let enc_neg_inf = encode_fp8(f32::NEG_INFINITY);
+        assert_eq!(enc_neg_inf & 0x7F, 0x7F, "Neg Inf should map to NaN");
+        assert_eq!(enc_neg_inf >> 7, 1, "Neg Inf NaN should preserve sign");
+
+        // E4M3 NaN decodes to f32 NaN
+        assert!(decode_fp8(0x7F).is_nan(), "0x7F should decode to NaN");
+        assert!(decode_fp8(0xFF).is_nan(), "0xFF should decode to NaN");
+    }
+
+    #[test]
+    fn fp8_max_value() {
+        // Max finite E4M3 = 448.0 (exp=15, mant=6 → 1.75 × 2^8)
+        let encoded = encode_fp8(448.0);
+        assert_eq!(encoded, 0x7E, "448.0 should encode to 0x7E (exp=15, mant=6)");
+        let decoded = decode_fp8(0x7E);
+        assert_eq!(decoded, 448.0, "0x7E should decode to 448.0");
+
+        // Negative max
+        let neg_encoded = encode_fp8(-448.0);
+        assert_eq!(neg_encoded, 0xFE, "-448.0 should encode to 0xFE");
+        let neg_decoded = decode_fp8(0xFE);
+        assert_eq!(neg_decoded, -448.0);
+    }
+
+    #[test]
+    fn fp8_overflow_clamps() {
+        // Values > 448 should clamp to max finite, not become NaN
+        let data = vec![1000.0_f32, -1000.0, 500.0, -600.0];
         let q = quantize_fp8(&data);
         let r = dequantize_fp8(&q);
-        assert!(r[0] <= FP8_MAX_VAL);
-        assert!(r[1] >= -FP8_MAX_VAL);
+        assert_eq!(r[0], 448.0, "1000.0 should clamp to 448.0");
+        assert_eq!(r[1], -448.0, "-1000.0 should clamp to -448.0");
+        assert_eq!(r[2], 448.0, "500.0 should clamp to 448.0");
+        assert_eq!(r[3], -448.0, "-600.0 should clamp to -448.0");
+
+        // Verify the encoded value is NOT NaN
+        for &byte in &q {
+            let exp = (byte >> 3) & 0xF;
+            let mant = byte & 0x7;
+            assert!(
+                !(exp == 15 && mant == 7),
+                "Clamped value must not produce NaN encoding"
+            );
+        }
+    }
+
+    #[test]
+    fn fp8_subnormals() {
+        // Smallest subnormal: 2^(-6) × (1/8) = 2^(-9) ≈ 0.001953125
+        let min_sub = 0.001953125_f32;
+        let encoded = encode_fp8(min_sub);
+        assert_eq!(encoded, 0x01, "Smallest subnormal should be 0x01 (exp=0, mant=1)");
+        let decoded = decode_fp8(0x01);
+        assert!((decoded - min_sub).abs() < 1e-10, "Smallest subnormal decode mismatch");
+
+        // Largest subnormal: 2^(-6) × (7/8) = 0.109375
+        let max_sub_decoded = decode_fp8(0x07); // exp=0, mant=7
+        let expected = (2.0f32).powi(-6) * 7.0 / 8.0;
+        assert!(
+            (max_sub_decoded - expected).abs() < 1e-7,
+            "Largest subnormal: got {}, expected {}",
+            max_sub_decoded,
+            expected
+        );
+
+        // Negative subnormal
+        let neg_encoded = encode_fp8(-min_sub);
+        assert_eq!(neg_encoded, 0x81, "Negative smallest subnormal should be 0x81");
+        let neg_decoded = decode_fp8(0x81);
+        assert!((neg_decoded + min_sub).abs() < 1e-10);
+    }
+
+    #[test]
+    fn fp8_underflow_flushes_to_zero() {
+        // Values smaller than smallest subnormal (2^-9) should flush to zero
+        let tiny = 1e-4_f32;
+        let encoded = encode_fp8(tiny);
+        let decoded = decode_fp8(encoded);
+        // Should be either zero or the smallest subnormal
+        assert!(
+            decoded.abs() <= 0.001953125,
+            "Very small value should flush to zero or smallest subnormal, got {}",
+            decoded
+        );
+
+        let tinier = 1e-6_f32;
+        let encoded2 = encode_fp8(tinier);
+        let decoded2 = decode_fp8(encoded2);
+        assert_eq!(decoded2, 0.0, "Extremely small value should flush to zero");
+    }
+
+    #[test]
+    fn fp8_negative_values() {
+        // Test that sign bit works correctly for normal values
+        let test_vals = [1.0f32, -1.0, 2.5, -2.5, 0.5, -0.5];
+        for &v in &test_vals {
+            let encoded = encode_fp8(v);
+            let decoded = decode_fp8(encoded);
+            assert_eq!(
+                decoded.is_sign_negative(),
+                v.is_sign_negative(),
+                "Sign mismatch for value {}",
+                v
+            );
+            assert!(
+                (decoded.abs() - v.abs()).abs() < v.abs() * 0.15,
+                "Round-trip error too large for {}: got {}",
+                v,
+                decoded
+            );
+        }
+    }
+
+    #[test]
+    fn fp8_known_normal_values() {
+        // 1.0 = 2^(1-7+7) × (1 + 0/8) → exp=7, mant=0 → 0b_0_0111_000 = 0x38
+        let enc = encode_fp8(1.0);
+        assert_eq!(enc, 0x38, "1.0 should encode to 0x38");
+        assert_eq!(decode_fp8(0x38), 1.0);
+
+        // 2.0 = 2^(8-7) = 2^1 → exp=8, mant=0 → 0b_0_1000_000 = 0x40
+        let enc2 = encode_fp8(2.0);
+        assert_eq!(enc2, 0x40, "2.0 should encode to 0x40");
+        assert_eq!(decode_fp8(0x40), 2.0);
+
+        // 0.5 = 2^(6-7) × (1+0/8) → exp=6, mant=0 → 0b_0_0110_000 = 0x30
+        let enc3 = encode_fp8(0.5);
+        assert_eq!(enc3, 0x30, "0.5 should encode to 0x30");
+        assert_eq!(decode_fp8(0x30), 0.5);
+
+        // Smallest normal: exp=1, mant=0 → 2^(1-7) = 2^(-6) = 0.015625
+        let enc4 = encode_fp8(0.015625);
+        assert_eq!(enc4, 0x08, "Min normal should encode to 0x08");
+        assert_eq!(decode_fp8(0x08), 0.015625);
+    }
+
+    #[test]
+    fn fp8_all_valid_round_trip() {
+        // Every valid FP8 encoding should round-trip through decode→encode
+        for byte in 0u8..=255 {
+            let exp = (byte >> 3) & 0xF;
+            let mant = byte & 0x7;
+
+            // Skip NaN
+            if exp == 15 && mant == 7 {
+                assert!(decode_fp8(byte).is_nan());
+                continue;
+            }
+
+            let decoded = decode_fp8(byte);
+            let re_encoded = encode_fp8(decoded);
+            let re_decoded = decode_fp8(re_encoded);
+
+            assert!(
+                (decoded - re_decoded).abs() < 1e-10 || (decoded == 0.0 && re_decoded == 0.0),
+                "Round-trip failed for byte 0x{:02X}: decoded={}, re_encoded=0x{:02X}, re_decoded={}",
+                byte,
+                decoded,
+                re_encoded,
+                re_decoded
+            );
+        }
     }
 
     #[test]
