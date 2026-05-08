@@ -218,7 +218,7 @@ fn run_simulate(model: ModelConfig, context: usize, budget_str: &str) {
             .as_deref()
             .unwrap_or("None");
         let fits_cell = if r.fits_in_budget {
-            Cell::new("YES").fg(Color::Green)
+            Cell::new("YES").fg(Color::Rgb { r: 0, g: 255, b: 200 })
         } else {
             Cell::new("NO").fg(Color::Red)
         };
