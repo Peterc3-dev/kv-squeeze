@@ -9,7 +9,7 @@ KV cache compression library and CLI for LLM inference on memory-constrained dev
 - **Memory simulator**: projects cache sizes for 7B/13B/70B model presets against a memory budget
 - Compare mode: side-by-side accuracy, throughput, and projected savings across all methods
 - Reports MSE, max error, mean error, compression ratio, and throughput (MB/s)
-- 18 tests covering quantization round-trips, eviction logic, and simulation
+- 25 tests covering quantization round-trips, eviction logic, and simulation
 - Library crate (`kv_squeeze`) usable as a dependency
 
 ## Install
@@ -44,6 +44,20 @@ kv-squeeze simulate --model 7b --context 8192 --budget 2gb
 ```
 cargo test
 ```
+
+## Integration: recursive-routing-racer-rs
+
+kv-squeeze is wired into [recursive-routing-racer-rs](../recursive-routing-racer-rs/) as a local path dependency, providing KV cache compression and eviction for the Vulkan compute Phi-4 inference engine.
+
+CLI flags:
+
+```
+rrr --kv-compress <none|fp16|fp8|int4>    # Compression mode (default: none)
+rrr --kv-evict <none|sliding|h2o>         # Eviction strategy (default: none)
+rrr --kv-budget <N>                       # Max cache entries before eviction
+```
+
+When active, compression stats are printed on exit: tokens inserted/evicted, peak cache size, compression ratio, and memory saved vs FP32 baseline.
 
 ---
 
