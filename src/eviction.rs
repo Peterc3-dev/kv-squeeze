@@ -265,7 +265,8 @@ mod tests {
         }
 
         // Evicted should be the lowest-attention non-sink tokens (positions 2, 3, 4, 5, 6)
-        let mut evicted_positions: Vec<usize> = evicted.iter().map(|&i| entries[i].position).collect();
+        let mut evicted_positions: Vec<usize> =
+            evicted.iter().map(|&i| entries[i].position).collect();
         evicted_positions.sort();
         assert_eq!(evicted_positions, vec![2, 3, 4, 5, 6]);
     }
@@ -283,6 +284,40 @@ mod tests {
                 entries[idx].position
             );
         }
+    }
+
+    #[test]
+    fn sliding_window_keeps_most_recent() {
+        // 10 tokens, sink=2, target=5 -> evict 5. Survivors must be the 2
+        // sinks (pos 0,1) plus the 3 most recent (pos 7,8,9).
+        let entries = make_entries(10);
+        let sw = SlidingWindow::new(2);
+        let evicted: std::collections::HashSet<usize> =
+            sw.select_evictions(&entries, 5).into_iter().collect();
+        let survivors: Vec<usize> = (0..entries.len())
+            .filter(|i| !evicted.contains(i))
+            .map(|i| entries[i].position)
+            .collect();
+        let mut survivors = survivors;
+        survivors.sort();
+        assert_eq!(survivors, vec![0, 1, 7, 8, 9]);
+    }
+
+    #[test]
+    fn h2o_no_eviction_under_budget() {
+        let entries = make_entries(4);
+        let h2o = H2OEviction::new(2);
+        assert!(h2o.select_evictions(&entries, 8).is_empty());
+    }
+
+    #[test]
+    fn eviction_strategy_dispatch_names() {
+        let s = EvictionStrategy::Sliding(SlidingWindow::new(1));
+        assert_eq!(s.as_eviction().name(), "Sliding Window");
+        let h = EvictionStrategy::H2O(H2OEviction::new(1));
+        assert_eq!(h.as_eviction().name(), "H2O (Heavy Hitter Oracle)");
+        let r = EvictionStrategy::Random(RandomEviction::new(1));
+        assert_eq!(r.as_eviction().name(), "Random");
     }
 
     #[test]
