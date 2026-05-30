@@ -1,6 +1,4 @@
-use crate::eviction::{
-    H2OEviction, SlidingWindow, TokenEntry, TokenEviction,
-};
+use crate::eviction::{H2OEviction, SlidingWindow, TokenEntry, TokenEviction};
 use crate::quantize::QuantMethod;
 
 /// Model configuration for simulation.
@@ -92,11 +90,20 @@ impl SimulationResult {
 pub fn parse_budget(s: &str) -> Option<usize> {
     let s = s.trim().to_lowercase();
     if let Some(num) = s.strip_suffix("gb") {
-        num.trim().parse::<f64>().ok().map(|n| (n * 1024.0 * 1024.0 * 1024.0) as usize)
+        num.trim()
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n * 1024.0 * 1024.0 * 1024.0) as usize)
     } else if let Some(num) = s.strip_suffix("mb") {
-        num.trim().parse::<f64>().ok().map(|n| (n * 1024.0 * 1024.0) as usize)
+        num.trim()
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n * 1024.0 * 1024.0) as usize)
     } else if let Some(num) = s.strip_suffix("kb") {
-        num.trim().parse::<f64>().ok().map(|n| (n * 1024.0) as usize)
+        num.trim()
+            .parse::<f64>()
+            .ok()
+            .map(|n| (n * 1024.0) as usize)
     } else {
         s.parse::<usize>().ok()
     }
@@ -129,9 +136,7 @@ pub fn simulate_cache(
     ];
 
     for &(quant_method, _quant_name) in &methods {
-        let quant_ratio = quant_method
-            .map(|m| m.compression_ratio())
-            .unwrap_or(1.0);
+        let quant_ratio = quant_method.map(|m| m.compression_ratio()).unwrap_or(1.0);
 
         for (eviction, eviction_name) in &eviction_configs {
             // Without eviction: full context
@@ -156,11 +161,9 @@ pub fn simulate_cache(
                 // With eviction: find max context that fits in budget
                 let bytes_per_token = (config.bytes_per_token_fp32() as f64 / quant_ratio) as usize;
                 let bytes_per_token_all_layers = bytes_per_token * config.num_layers;
-                let max_tokens = if bytes_per_token_all_layers > 0 {
-                    budget_bytes / bytes_per_token_all_layers
-                } else {
-                    context_len
-                };
+                let max_tokens = budget_bytes
+                    .checked_div(bytes_per_token_all_layers)
+                    .unwrap_or(context_len);
                 let effective = max_tokens.min(context_len);
                 let compressed = effective * bytes_per_token_all_layers;
                 let fits = compressed <= budget_bytes;
@@ -248,6 +251,51 @@ mod tests {
         // At 4096 tokens: 4,294,967,296 bytes = 4 GB
         let size = m.cache_size_bytes(4096);
         assert_eq!(size, 32 * 2 * 32 * 128 * 4 * 4096);
+    }
+
+    #[test]
+    fn parse_budget_kb_plain_and_invalid() {
+        assert_eq!(parse_budget("4kb"), Some(4 * 1024));
+        assert_eq!(parse_budget("1048576"), Some(1_048_576));
+        assert_eq!(parse_budget("  2 gb "), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_budget("garbage"), None);
+        assert_eq!(parse_budget("gb"), None);
+    }
+
+    #[test]
+    fn gqa_70b_has_fewer_kv_heads() {
+        let m = ModelConfig::preset_70b();
+        // 70B preset uses GQA: only 8 KV heads despite 80 layers.
+        assert_eq!(m.num_kv_heads, 8);
+        // Per-token bytes: 2(K+V) * 8 heads * 128 dim * 4 bytes = 8192.
+        assert_eq!(m.bytes_per_token_fp32(), 2 * 8 * 128 * 4);
+    }
+
+    #[test]
+    fn simulate_single_reports_method_ratio() {
+        let r = simulate_single(32, 128, 4096, QuantMethod::INT4);
+        assert_eq!(r.compression_ratio, QuantMethod::INT4.compression_ratio());
+        assert_eq!(r.baseline_bytes, 2 * 32 * 128 * 4 * 4096);
+        // INT4 nominal 8x.
+        assert_eq!(r.compressed_bytes, r.baseline_bytes / 8);
+    }
+
+    #[test]
+    fn simulate_eviction_reduces_effective_context() {
+        let config = ModelConfig::preset_7b();
+        // Tiny budget forces eviction to cap effective context below requested.
+        let results = simulate_cache(&config, 8192, 256 * 1024 * 1024);
+        let evicted: Vec<_> = results
+            .iter()
+            .filter(|r| r.eviction_strategy.is_some())
+            .collect();
+        assert!(!evicted.is_empty());
+        for r in evicted {
+            assert!(
+                r.effective_context <= r.context_len,
+                "effective context must not exceed requested context"
+            );
+        }
     }
 
     #[test]

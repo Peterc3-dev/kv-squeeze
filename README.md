@@ -9,7 +9,7 @@ KV cache compression library and CLI for LLM inference on memory-constrained dev
 - **Memory simulator**: projects cache sizes for 7B/13B/70B model presets against a memory budget
 - Compare mode: side-by-side accuracy, throughput, and projected savings across all methods
 - Reports MSE, max error, mean error, compression ratio, and throughput (MB/s)
-- 25 tests covering quantization round-trips, eviction logic, and simulation
+- 36 tests covering quantization round-trips, eviction logic, and simulation
 - Library crate (`kv_squeeze`) usable as a dependency
 
 ## Install

@@ -71,10 +71,7 @@ fn parse_method(s: &str) -> Result<QuantMethod, String> {
         "fp16" => Ok(QuantMethod::FP16),
         "fp8" | "fp8e4m3" | "e4m3" => Ok(QuantMethod::FP8E4M3),
         "int4" | "i4" => Ok(QuantMethod::INT4),
-        other => Err(format!(
-            "Unknown method '{}'. Use: fp16, fp8, int4",
-            other
-        )),
+        other => Err(format!("Unknown method '{}'. Use: fp16, fp8, int4", other)),
     }
 }
 
@@ -83,10 +80,7 @@ fn parse_model(s: &str) -> Result<ModelConfig, String> {
         "7b" => Ok(ModelConfig::preset_7b()),
         "13b" => Ok(ModelConfig::preset_13b()),
         "70b" => Ok(ModelConfig::preset_70b()),
-        other => Err(format!(
-            "Unknown model '{}'. Use: 7b, 13b, 70b",
-            other
-        )),
+        other => Err(format!("Unknown model '{}'. Use: 7b, 13b, 70b", other)),
     }
 }
 
@@ -125,9 +119,10 @@ fn run_bench(heads: usize, dim: usize, seq_len: usize, method: QuantMethod) {
     let stats = quantize::round_trip_stats(&data, method);
     let elapsed = start.elapsed();
 
-    print_stats_table(&[stats.clone()]);
+    print_stats_table(std::slice::from_ref(&stats));
 
-    println!("\nThroughput: {:.1} MB/s (compress + decompress + measure)",
+    println!(
+        "\nThroughput: {:.1} MB/s (compress + decompress + measure)",
         (num_elements as f64 * 4.0 / (1024.0 * 1024.0)) / elapsed.as_secs_f64()
     );
     println!("Wall time:  {:.1} ms", elapsed.as_secs_f64() * 1000.0);
@@ -213,12 +208,13 @@ fn run_simulate(model: ModelConfig, context: usize, budget_str: &str) {
             .quant_method
             .map(|m| m.to_string())
             .unwrap_or_else(|| "FP32".to_string());
-        let eviction_str = r
-            .eviction_strategy
-            .as_deref()
-            .unwrap_or("None");
+        let eviction_str = r.eviction_strategy.as_deref().unwrap_or("None");
         let fits_cell = if r.fits_in_budget {
-            Cell::new("YES").fg(Color::Rgb { r: 0, g: 255, b: 200 })
+            Cell::new("YES").fg(Color::Rgb {
+                r: 0,
+                g: 255,
+                b: 200,
+            })
         } else {
             Cell::new("NO").fg(Color::Red)
         };

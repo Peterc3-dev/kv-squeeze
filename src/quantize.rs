@@ -274,7 +274,7 @@ pub fn quantize_int4(data: &[f32]) -> Int4Packed {
 
 /// Quantize with configurable group size.
 pub fn quantize_int4_grouped(data: &[f32], group_size: usize) -> Int4Packed {
-    let num_groups = (data.len() + group_size - 1) / group_size;
+    let num_groups = data.len().div_ceil(group_size);
 
     // Compute scales per group (parallel)
     let scales: Vec<f16> = (0..num_groups)
@@ -310,7 +310,7 @@ pub fn quantize_int4_grouped(data: &[f32], group_size: usize) -> Int4Packed {
                 .collect();
 
             // Pack pairs into bytes (low nibble = first element)
-            let mut packed = Vec::with_capacity((quants.len() + 1) / 2);
+            let mut packed = Vec::with_capacity(quants.len().div_ceil(2));
             for pair in quants.chunks(2) {
                 let lo = (pair[0] as u8) & 0x0F;
                 let hi = if pair.len() > 1 {
@@ -549,7 +549,10 @@ mod tests {
     fn fp8_max_value() {
         // Max finite E4M3 = 448.0 (exp=15, mant=6 → 1.75 × 2^8)
         let encoded = encode_fp8(448.0);
-        assert_eq!(encoded, 0x7E, "448.0 should encode to 0x7E (exp=15, mant=6)");
+        assert_eq!(
+            encoded, 0x7E,
+            "448.0 should encode to 0x7E (exp=15, mant=6)"
+        );
         let decoded = decode_fp8(0x7E);
         assert_eq!(decoded, 448.0, "0x7E should decode to 448.0");
 
@@ -587,9 +590,15 @@ mod tests {
         // Smallest subnormal: 2^(-6) × (1/8) = 2^(-9) ≈ 0.001953125
         let min_sub = 0.001953125_f32;
         let encoded = encode_fp8(min_sub);
-        assert_eq!(encoded, 0x01, "Smallest subnormal should be 0x01 (exp=0, mant=1)");
+        assert_eq!(
+            encoded, 0x01,
+            "Smallest subnormal should be 0x01 (exp=0, mant=1)"
+        );
         let decoded = decode_fp8(0x01);
-        assert!((decoded - min_sub).abs() < 1e-10, "Smallest subnormal decode mismatch");
+        assert!(
+            (decoded - min_sub).abs() < 1e-10,
+            "Smallest subnormal decode mismatch"
+        );
 
         // Largest subnormal: 2^(-6) × (7/8) = 0.109375
         let max_sub_decoded = decode_fp8(0x07); // exp=0, mant=7
@@ -603,7 +612,10 @@ mod tests {
 
         // Negative subnormal
         let neg_encoded = encode_fp8(-min_sub);
-        assert_eq!(neg_encoded, 0x81, "Negative smallest subnormal should be 0x81");
+        assert_eq!(
+            neg_encoded, 0x81,
+            "Negative smallest subnormal should be 0x81"
+        );
         let neg_decoded = decode_fp8(0x81);
         assert!((neg_decoded + min_sub).abs() < 1e-10);
     }
@@ -744,6 +756,47 @@ mod tests {
         let q = quantize_fp16(&data);
         let r = dequantize_fp16(&q);
         assert_eq!(r.len(), data.len());
+    }
+
+    #[test]
+    fn int4_grouped_custom_group_size() {
+        // Group size that does not evenly divide the element count exercises
+        // the ragged-tail packing/unpacking path.
+        let data = sample_data(70);
+        let packed = quantize_int4_grouped(&data, 16);
+        assert_eq!(packed.group_size, 16);
+        assert_eq!(packed.num_elements, 70);
+        // ceil(70/16) = 5 groups -> 5 scales.
+        assert_eq!(packed.scales.len(), 5);
+        let r = dequantize_int4(&packed);
+        assert_eq!(r.len(), 70);
+    }
+
+    #[test]
+    fn int4_packed_size_matches_formula() {
+        let data = sample_data(100);
+        let packed = quantize_int4_grouped(&data, 32);
+        // ceil(100/2) data bytes + ceil(100/32)*2 scale bytes.
+        let expected = 100usize.div_ceil(2) + 100usize.div_ceil(32) * 2;
+        assert_eq!(packed.size_bytes(), expected);
+    }
+
+    #[test]
+    fn quant_method_bits_and_display() {
+        assert_eq!(QuantMethod::FP16.bits_per_element(), 16);
+        assert_eq!(QuantMethod::FP8E4M3.bits_per_element(), 8);
+        assert_eq!(QuantMethod::INT4.bits_per_element(), 4);
+        assert_eq!(QuantMethod::FP16.to_string(), "FP16");
+        assert_eq!(QuantMethod::FP8E4M3.to_string(), "FP8 (E4M3)");
+        assert_eq!(QuantMethod::INT4.to_string(), "INT4 (grouped)");
+    }
+
+    #[test]
+    fn round_trip_empty_input() {
+        let stats = round_trip_stats(&[], QuantMethod::FP8E4M3);
+        assert_eq!(stats.num_elements, 0);
+        assert_eq!(stats.mse, 0.0);
+        assert_eq!(stats.compressed_bytes, 0);
     }
 
     #[test]
